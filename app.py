@@ -13,6 +13,12 @@ from sklearn.metrics import (confusion_matrix, f1_score,
                              precision_recall_fscore_support, accuracy_score)
 import os
 import json
+import shap, pickle, numpy as np
+
+with open("model.pkl","rb") as f: model = pickle.load(f)
+X = np.load("X_test_selected.npy")[:10]
+sv = shap.TreeExplainer(model).shap_values(X)
+print(type(sv), np.array(sv).shape if not isinstance(sv, list) else [np.array(s).shape for s in sv])
 
 st.set_page_config(page_title="XAI-IDS Dashboard", layout="wide")
 
@@ -28,40 +34,61 @@ ALERT_CLASSES  = {0, 1, 2, 3, 5}
 MINORITY_CLASS = 3
 
 SHAP_BEESWARM  = "shap_beeswarm.png"
-SHAP_META      = "shap_meta.json"   # stores time_ms and bar data path
+SHAP_META      = "shap_meta.json"
 SHAP_BAR_CSV   = "shap_bar.csv"
+
+REQUIRED_FILES = ["model.pkl", "final_features.pkl", "X_test_selected.npy", "X_res.npy", "y_test.npy"]
+
 
 # ── Load + stratified shuffle ───────────────────────────────
 @st.cache_resource
 def load_all():
-    with open("model.pkl", "rb") as f:
-        model = pickle.load(f)
-    with open("final_features.pkl", "rb") as f:
-        final_features = pickle.load(f)
+    missing = [f for f in REQUIRED_FILES if not os.path.exists(f)]
+    if missing:
+        return None, None, None, None, None, missing
 
-    X_test = np.load("X_test_selected.npy")
-    X_res  = np.load("X_res.npy")
-    y_test = np.load("y_test.npy")
+    try:
+        with open("model.pkl", "rb") as f:
+            model = pickle.load(f)
+        with open("final_features.pkl", "rb") as f:
+            final_features = pickle.load(f)
 
-    # Interleave all 6 classes so every class appears from flow #1
-    indices = [np.where(y_test == c)[0] for c in range(6)]
-    max_len = max(len(i) for i in indices)
-    interleaved = []
-    for pos in range(max_len):
-        for cls in range(6):
-            if pos < len(indices[cls]):
-                interleaved.append(indices[cls][pos])
-    interleaved = np.array(interleaved)
+        X_test = np.load("X_test_selected.npy")
+        X_res  = np.load("X_res.npy")
+        y_test = np.load("y_test.npy")
 
-    lime_explainer = LimeTabularExplainer(
-        X_res,
-        feature_names=final_features,
-        class_names=[CLASS_NAMES[i] for i in range(6)],
-        mode='classification'
+        # Interleave all 6 classes so every class appears from flow #1
+        indices = [np.where(y_test == c)[0] for c in range(6)]
+        max_len = max(len(i) for i in indices)
+        interleaved = []
+        for pos in range(max_len):
+            for cls in range(6):
+                if pos < len(indices[cls]):
+                    interleaved.append(indices[cls][pos])
+        interleaved = np.array(interleaved)
+
+        lime_explainer = LimeTabularExplainer(
+            X_res,
+            feature_names=final_features,
+            class_names=[CLASS_NAMES[i] for i in range(6)],
+            mode='classification'
+        )
+        return model, X_test[interleaved], y_test[interleaved], final_features, lime_explainer, []
+    except Exception as e:
+        return None, None, None, None, None, [str(e)]
+
+
+model, X_test_selected, y_test, final_features, lime_explainer, load_errors = load_all()
+
+if load_errors:
+    st.error(
+        "⚠️ Required files are missing or failed to load:\n\n"
+        + "\n".join(f"- `{e}`" for e in load_errors)
+        + "\n\nPlace `model.pkl`, `final_features.pkl`, `X_test_selected.npy`, "
+          "`X_res.npy`, and `y_test.npy` in the working directory, then restart the app."
     )
-    return model, X_test[interleaved], y_test[interleaved], final_features, lime_explainer
+    st.stop()
 
-model, X_test_selected, y_test, final_features, lime_explainer = load_all()
 
 # ── Helpers ─────────────────────────────────────────────────
 def shap_files_exist():
@@ -69,8 +96,9 @@ def shap_files_exist():
             os.path.exists(SHAP_META) and
             os.path.exists(SHAP_BAR_CSV))
 
+
 def compute_and_save_shap(sample_size):
-    """Run SHAP and save all outputs to disk. Returns time_ms or None on error."""
+    """Run SHAP and save all outputs to disk. Returns time_ms or error string."""
     try:
         sample      = X_test_selected[:sample_size]
         explainer   = shap.TreeExplainer(model)
@@ -79,13 +107,37 @@ def compute_and_save_shap(sample_size):
         t1          = time.perf_counter()
         shap_ms     = (t1 - t0) * 1000
 
-        # Mean |SHAP| per feature averaged across classes
+        n_features = len(final_features)
+
+        # ── Normalize shap_values into a list of per-class 2D arrays ──
         if isinstance(shap_values, list):
-            stacked   = np.stack([np.abs(sv) for sv in shap_values], axis=0)
-            mean_shap = stacked.mean(axis=0).mean(axis=0)
+            # Old API: list of (n_samples, n_features) arrays, one per class
+            class_arrays = [np.array(sv) for sv in shap_values]
         else:
-            mean_shap = np.abs(shap_values).mean(axis=0)
+            shap_values = np.array(shap_values)
+            if shap_values.ndim == 3:
+                # New API: (n_samples, n_features, n_classes)
+                if shap_values.shape[1] == n_features:
+                    class_arrays = [shap_values[:, :, c] for c in range(shap_values.shape[2])]
+                # Some versions return (n_classes, n_samples, n_features)
+                elif shap_values.shape[2] == n_features:
+                    class_arrays = [shap_values[c, :, :] for c in range(shap_values.shape[0])]
+                else:
+                    raise ValueError(f"Unexpected SHAP array shape: {shap_values.shape}")
+            else:
+                # Binary / regression: single (n_samples, n_features) array
+                class_arrays = [shap_values]
+
+        # Mean |SHAP| per feature, averaged across classes then samples
+        stacked   = np.stack([np.abs(arr) for arr in class_arrays], axis=0)  # (n_classes, n_samples, n_features)
+        mean_shap = stacked.mean(axis=0).mean(axis=0)                        # (n_features,)
         mean_shap = np.array(mean_shap).flatten()
+
+        if len(mean_shap) != n_features:
+            raise ValueError(
+                f"Feature count mismatch: mean_shap has {len(mean_shap)} "
+                f"values but final_features has {n_features}."
+            )
 
         bar_df = pd.DataFrame({
             "Feature":     list(final_features),
@@ -93,14 +145,26 @@ def compute_and_save_shap(sample_size):
         }).sort_values("Mean |SHAP|", ascending=False).reset_index(drop=True)
         bar_df.to_csv(SHAP_BAR_CSV, index=False)
 
-        # Beeswarm — let SHAP own the figure
+        # ── Beeswarm: use the highest-signal class (or class 0 as fallback) ──
+        # summary_plot with multi-class list works fine if shapes are per-class 2D
         plt.close("all")
-        shap.summary_plot(
-            shap_values, sample,
-            feature_names=final_features,
-            show=False,
-            plot_size=(10, 6)
-        )
+        try:
+            shap.summary_plot(
+                class_arrays if len(class_arrays) > 1 else class_arrays[0],
+                sample,
+                feature_names=final_features,
+                show=False,
+                plot_size=(10, 6)
+            )
+        except Exception:
+            # Fallback: plot mean-magnitude single class if multi-class plot fails
+            shap.summary_plot(
+                class_arrays[0],
+                sample,
+                feature_names=final_features,
+                show=False,
+                plot_size=(10, 6)
+            )
         plt.tight_layout()
         plt.savefig(SHAP_BEESWARM, dpi=120, bbox_inches="tight")
         plt.close("all")
@@ -111,7 +175,8 @@ def compute_and_save_shap(sample_size):
         return shap_ms
 
     except Exception as e:
-        return str(e)   # return error string so caller can show it
+        return str(e)
+
 
 # ── Session state ───────────────────────────────────────────
 defaults = {
@@ -127,6 +192,7 @@ for k, v in defaults.items():
 
 process = psutil.Process(os.getpid())
 
+
 # ── Sidebar ─────────────────────────────────────────────────
 st.sidebar.title("⚙️ Simulation Controls")
 flows_per_second = st.sidebar.slider("Flows per second",        1,   50,   5)
@@ -141,11 +207,11 @@ if reset:
     for f in [SHAP_BEESWARM, SHAP_META, SHAP_BAR_CSV]:
         if os.path.exists(f):
             os.remove(f)
-    # Clean up any LIME files
     for f in os.listdir("."):
         if f.startswith("lime_flow_") and f.endswith(".png"):
             os.remove(f)
     st.rerun()
+
 
 # ── Header ───────────────────────────────────────────────────
 st.title("🛡️ Explainable AI — Intrusion Detection System")
@@ -164,6 +230,7 @@ tab_live, tab_explain, tab_shap, tab_perf, tab_eval = st.tabs([
     "📊 Evaluation"
 ])
 
+
 # ══════════════════════════════════════════════════════════
 # TAB 1 — LIVE DETECTION
 # ══════════════════════════════════════════════════════════
@@ -181,7 +248,6 @@ with tab_live:
     dist_placeholder = st.empty()
 
     if start:
-        # Full reset
         for k, v in defaults.items():
             st.session_state[k] = v
         for f in [SHAP_BEESWARM, SHAP_META, SHAP_BAR_CSV]:
@@ -190,6 +256,8 @@ with tab_live:
 
         delay = 1.0 / flows_per_second
         n     = min(max_flows, len(X_test_selected))
+
+        psutil.cpu_percent(interval=None)  # warm up sampler once before loop
 
         for i in range(n):
             row = X_test_selected[i].reshape(1, -1)
@@ -224,7 +292,6 @@ with tab_live:
             latency_box.metric("⚡ Avg Latency", f"{np.mean(st.session_state.latencies):.3f} ms")
             alert_box.metric("🚨 Alerts",        str(len(st.session_state.attack_rows)))
 
-            # Single unified status column
             if correct and not is_attack:
                 status = "✅ Benign"
             elif correct and is_attack:
@@ -257,8 +324,6 @@ with tab_live:
 
         st.session_state.sim_done = True
 
-        # ── SHAP: compute and write to disk immediately ─────
-        # Using st.status so user sees it happening
         with st.status("Computing SHAP global explanations...", expanded=True) as shap_status:
             result = compute_and_save_shap(shap_sample_size)
             if isinstance(result, float):
@@ -277,7 +342,6 @@ with tab_live:
             f"{len(st.session_state.attack_rows)} attacks detected."
         )
 
-    # Persist display after sim ends
     if st.session_state.log and not start:
         feed_placeholder.dataframe(
             pd.DataFrame(st.session_state.log[-20:]),
@@ -295,6 +359,7 @@ with tab_live:
             "⬇️ Export CSV", csv,
             "simulation_results.csv", "text/csv"
         )
+
 
 # ══════════════════════════════════════════════════════════
 # TAB 2 — LIME ON-DEMAND
@@ -355,18 +420,17 @@ with tab_explain:
                 "it never touches the live detection pipeline."
             )
 
-            # ── FIX: probability table with correct class mapping ──
             st.subheader("Predicted class probabilities")
             proba = model.predict_proba(
                 X_test_selected[flow_idx].reshape(1, -1)
             )[0]
-            # Build with explicit class index — don't sort then show index
             prob_df = pd.DataFrame({
                 "Class ID": list(CLASS_NAMES.keys()),
                 "Class":    list(CLASS_NAMES.values()),
                 "Probability": np.round(proba, 4).tolist()
             }).sort_values("Probability", ascending=False).reset_index(drop=True)
             st.dataframe(prob_df, use_container_width=True)
+
 
 # ══════════════════════════════════════════════════════════
 # TAB 3 — SHAP GLOBAL VIEW
@@ -383,7 +447,6 @@ with tab_shap:
     if not shap_files_exist():
         st.info("Run the simulation — SHAP computes automatically when it finishes.")
 
-        # Manual trigger fallback (in case auto-compute failed)
         if st.session_state.sim_done:
             if st.button("🔬 Retry SHAP Computation"):
                 with st.spinner("Computing SHAP..."):
@@ -394,7 +457,6 @@ with tab_shap:
                 else:
                     st.error(f"SHAP failed: {result}")
     else:
-        # Load from disk — always reliable, never depends on session state
         with open(SHAP_META, "r") as f:
             meta = json.load(f)
 
@@ -425,6 +487,7 @@ with tab_shap:
 
         st.dataframe(bar_df, use_container_width=True)
 
+
 # ══════════════════════════════════════════════════════════
 # TAB 4 — PERFORMANCE
 # ══════════════════════════════════════════════════════════
@@ -453,12 +516,6 @@ with tab_perf:
         st.pyplot(fig)
         plt.close(fig)
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Avg Latency",           f"{avg_lat:.3f} ms")
-        c2.metric("Max Latency",           f"{np.max(st.session_state.latencies):.3f} ms")
-        c3.metric("Effective Throughput",  f"{throughput:.0f} flows/sec")
-
-        # ── Real-time readiness assessment ──────────────────
         st.subheader("Real-Time Readiness Assessment")
         rt1, rt2, rt3 = st.columns(3)
         rt1.metric("Avg inference time",    f"{avg_lat:.3f} ms",
@@ -468,7 +525,6 @@ with tab_perf:
         rt3.metric("Flows/sec (inference)", f"{throughput:.0f}",
                    help="Enterprise networks: ~1,000–10,000 flows/min typical")
 
-        # Colour-coded verdict
         if avg_lat < 1.0:
             st.success("✅ Excellent — avg latency under 1ms. Suitable for high-throughput edge deployment.")
         elif avg_lat < 5.0:
@@ -526,6 +582,7 @@ with tab_perf:
 
     else:
         st.info("Run the simulation first.")
+
 
 # ══════════════════════════════════════════════════════════
 # TAB 5 — EVALUATION
