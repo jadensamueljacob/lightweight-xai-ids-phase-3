@@ -1,4 +1,3 @@
-
 import numpy as np
 import pickle
 import time
@@ -7,13 +6,22 @@ import psutil
 import pandas as pd
 import matplotlib.pyplot as plt
 
-with open("model.pkl", "rb") as f:
+MODEL_PATH = "model.pkl"
+DATA_PATH = "X_test_selected.npy"
+
+if not os.path.exists(MODEL_PATH) or not os.path.exists(DATA_PATH):
+    raise FileNotFoundError(
+        f"Required files missing. Ensure '{MODEL_PATH}' and '{DATA_PATH}' "
+        "are in the working directory before running this script."
+    )
+
+with open(MODEL_PATH, "rb") as f:
     model = pickle.load(f)
-X_test_selected = np.load("X_test_selected.npy")
+X_test_selected = np.load(DATA_PATH)
 
 process = psutil.Process(os.getpid())
 
-# ── Renamed: these are BATCH SIZES, not enforced arrival rates ──
+# ── Batch sizes (not enforced arrival rates) ──
 scenarios = {
     "100 samples": 100,
     "500 samples": 500,
@@ -23,14 +31,22 @@ scenarios = {
 
 results = {}
 
+# Warm up CPU sampler once globally before the loop
+psutil.cpu_percent(interval=None)
+time.sleep(0.1)
+
 for label, n_requested in scenarios.items():
     n = min(n_requested, len(X_test_selected))
-    latencies, cpus = [], []
+    if n == 0:
+        print(f"Skipping '{label}': no samples available.")
+        continue
+
+    latencies = []
     mem_before = process.memory_info().rss / (1024 * 1024)
 
     print(f"Running batch: {label} ...")
 
-    # warm-up CPU sampling so the first reading is not zero/garbage
+    # Reset CPU sampling window before timing this scenario
     psutil.cpu_percent(interval=None)
 
     t_start = time.perf_counter()
@@ -40,8 +56,8 @@ for label, n_requested in scenarios.items():
         model.predict(row)
         t1 = time.perf_counter()
         latencies.append((t1 - t0) * 1000)
-
     t_end = time.perf_counter()
+
     cpu_after = psutil.cpu_percent(interval=0.1)  # one clean sample per scenario
     mem_after = process.memory_info().rss / (1024 * 1024)
 
@@ -50,8 +66,8 @@ for label, n_requested in scenarios.items():
 
     results[label] = {
         "n": n,
-        "avg_latency_ms": np.mean(latencies),
-        "max_latency_ms": np.max(latencies),
+        "avg_latency_ms": float(np.mean(latencies)),
+        "max_latency_ms": float(np.max(latencies)),
         "total_time_s": total_time_s,
         "throughput_flows_per_sec": throughput,
         "cpu_percent": cpu_after,
@@ -62,6 +78,9 @@ for label, n_requested in scenarios.items():
     print(f"  Avg latency: {np.mean(latencies):.4f} ms | "
           f"Throughput: {throughput:.1f} flows/sec | "
           f"CPU: {cpu_after:.1f}% | Process Mem: {mem_after:.1f} MB")
+
+if not results:
+    raise RuntimeError("No scenarios ran successfully — check input data size.")
 
 # ── Save results as CSV ──────────────────────────────────
 results_df = pd.DataFrame(results).T
