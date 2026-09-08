@@ -19,13 +19,13 @@ print(f"X_test_selected: {X_test_selected.shape}")
 print(f"X_res shape: {X_res.shape}")
 print(f"y_test shape: {y_test.shape}")
 
-# ── Original checks ──────────────────────────────────────
+# ── Original checks ───────────────────────────────────────
 assert model.n_features_in_ == 15, "❌ model feature count wrong"
 assert len(final_features) == 15, "❌ final_features count wrong"
 assert X_test_selected.shape[1] == 15, "❌ X_test_selected column count wrong"
 assert X_res.shape[1] == 15, "❌ X_res column count wrong"
 
-# ── New checks (added) ───────────────────────────────────
+# ── New checks (added) ────────────────────────────────────
 # 1. X_test_selected and y_test must have matching lengths
 assert X_test_selected.shape[0] == y_test.shape[0], \
     "❌ X_test_selected and y_test row counts do not match"
