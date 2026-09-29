@@ -15,11 +15,6 @@ import os
 import json
 import shap, pickle, numpy as np
 
-with open("model.pkl","rb") as f: model = pickle.load(f)
-X = np.load("X_test_selected.npy")[:10]
-sv = shap.TreeExplainer(model).shap_values(X)
-print(type(sv), np.array(sv).shape if not isinstance(sv, list) else [np.array(s).shape for s in sv])
-
 st.set_page_config(page_title="XAI-IDS Dashboard", layout="wide")
 
 CLASS_NAMES = {
@@ -32,6 +27,14 @@ CLASS_NAMES = {
 }
 ALERT_CLASSES  = {0, 1, 2, 3, 5}
 MINORITY_CLASS = 3
+
+DEFAULT_ALERT_THRESHOLDS = {
+    0: 0.50,
+    1: 0.50,
+    2: 0.50,
+    3: 0.50,
+    5: 0.50,
+}
 
 SHAP_BEESWARM  = "shap_beeswarm.png"
 SHAP_META      = "shap_meta.json"
@@ -178,6 +181,15 @@ def compute_and_save_shap(sample_size):
         return str(e)
 
 
+# ── Alert threshold helpers ─────────────────────────────────
+def alert_is_triggered(pred, confidence, thresholds):
+    return pred in ALERT_CLASSES and confidence >= thresholds[pred]
+
+
+def threshold_label(class_id, threshold):
+    return f"{CLASS_NAMES[class_id]} — {threshold:.0%}"
+
+
 # ── Session state ───────────────────────────────────────────
 defaults = {
     "log":               [],
@@ -185,6 +197,7 @@ defaults = {
     "latencies":         [],
     "explain_latencies": [],
     "sim_done":          False,
+    "alert_thresholds":  DEFAULT_ALERT_THRESHOLDS.copy(),
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -198,12 +211,36 @@ st.sidebar.title("⚙️ Simulation Controls")
 flows_per_second = st.sidebar.slider("Flows per second",        1,   50,   5)
 max_flows        = st.sidebar.slider("Total flows to simulate", 50, 2000, 500)
 shap_sample_size = st.sidebar.slider("SHAP sample size",        50,  300, 100)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🚨 Alert Thresholds")
+st.sidebar.caption(
+    "An attack is alerted only when its predicted probability reaches "
+    "the threshold set for that class. Model predictions and evaluation "
+    "metrics are unchanged."
+)
+
+for class_id in sorted(ALERT_CLASSES):
+    st.session_state.alert_thresholds[class_id] = (
+        st.sidebar.slider(
+            CLASS_NAMES[class_id],
+            min_value=0,
+            max_value=100,
+            value=int(st.session_state.alert_thresholds[class_id] * 100),
+            step=5,
+            key=f"threshold_{class_id}",
+            format="%d%%"
+        ) / 100.0
+    )
+
 start = st.sidebar.button("▶ Start Simulation")
 reset = st.sidebar.button("⟲ Reset")
 
 if reset:
     for k, v in defaults.items():
         st.session_state[k] = v
+    for class_id in ALERT_CLASSES:
+        st.session_state.pop(f"threshold_{class_id}", None)
     for f in [SHAP_BEESWARM, SHAP_META, SHAP_BAR_CSV]:
         if os.path.exists(f):
             os.remove(f)
@@ -217,9 +254,10 @@ if reset:
 st.title("🛡️ Explainable AI — Intrusion Detection System")
 st.markdown(
     "Simulated real-time replay of CICIDS2017 test flows through the trained "
-    "Decision Tree. Detection runs continuously; **LIME** explanations are "
-    "generated on demand per alert; **SHAP** global view computes automatically "
-    "after simulation ends."
+    "Decision Tree. Detection runs continuously; per-class confidence "
+    "thresholds control which predicted attacks become alerts. **LIME** "
+    "explanations are generated on demand per alert; **SHAP** global view "
+    "computes automatically after simulation ends."
 )
 
 tab_live, tab_explain, tab_shap, tab_perf, tab_eval = st.tabs([
@@ -242,6 +280,16 @@ with tab_live:
     alert_box   = m4.empty()
 
     st.markdown("---")
+    st.subheader("Current Alert Policy")
+    policy_df = pd.DataFrame({
+        "Attack Class": [CLASS_NAMES[c] for c in sorted(ALERT_CLASSES)],
+        "Alert Threshold": [
+            f"{st.session_state.alert_thresholds[c]:.0%}"
+            for c in sorted(ALERT_CLASSES)
+        ]
+    })
+    st.dataframe(policy_df, hide_index=True, use_container_width=True)
+
     st.subheader("Live Traffic Feed (last 20 flows)")
     feed_placeholder = st.empty()
     st.subheader("Class Distribution So Far")
@@ -249,7 +297,8 @@ with tab_live:
 
     if start:
         for k, v in defaults.items():
-            st.session_state[k] = v
+            if k != "alert_thresholds":
+                st.session_state[k] = v
         for f in [SHAP_BEESWARM, SHAP_META, SHAP_BAR_CSV]:
             if os.path.exists(f):
                 os.remove(f)
@@ -270,18 +319,26 @@ with tab_live:
             latency_ms = (t1 - t0) * 1000
             st.session_state.latencies.append(latency_ms)
 
-            is_attack  = pred in ALERT_CLASSES
+            predicted_attack = pred in ALERT_CLASSES
             class_name = CLASS_NAMES[pred]
-            confidence = float(max(prob))
+            confidence = float(prob[pred])
             true_label = int(y_test[i])
             correct    = (pred == true_label)
+            alert_triggered = alert_is_triggered(
+                pred, confidence, st.session_state.alert_thresholds
+            )
 
-            if is_attack:
+            if alert_triggered:
                 st.session_state.attack_rows.append({
                     "flow_idx":   i,
                     "pred":       pred,
                     "confidence": confidence,
-                    "label": f"Flow #{i+1} | {class_name} | Conf {confidence:.2f}"
+                    "threshold":  st.session_state.alert_thresholds[pred],
+                    "label": (
+                        f"Flow #{i+1} | {class_name} | "
+                        f"Conf {confidence:.2f} ≥ "
+                        f"{st.session_state.alert_thresholds[pred]:.2f}"
+                    )
                 })
 
             cpu    = psutil.cpu_percent(interval=None)
@@ -292,12 +349,12 @@ with tab_live:
             latency_box.metric("⚡ Avg Latency", f"{np.mean(st.session_state.latencies):.3f} ms")
             alert_box.metric("🚨 Alerts",        str(len(st.session_state.attack_rows)))
 
-            if correct and not is_attack:
+            if alert_triggered:
+                status = "🚨 Alert"
+            elif predicted_attack:
+                status = "🔕 Suppressed"
+            elif correct:
                 status = "✅ Benign"
-            elif correct and is_attack:
-                status = "🚨 Attack (correct)"
-            elif not correct and is_attack:
-                status = "⚠️ Attack (misclassified)"
             else:
                 status = "❌ Missed attack"
 
@@ -306,6 +363,11 @@ with tab_live:
                 "True Class":   CLASS_NAMES[true_label],
                 "Predicted":    class_name,
                 "Confidence":   f"{confidence:.2f}",
+                "Alert":        "Yes" if alert_triggered else "No",
+                "Threshold":    (
+                    f"{st.session_state.alert_thresholds[pred]:.2f}"
+                    if predicted_attack else "—"
+                ),
                 "Status":       status,
                 "Latency (ms)": f"{latency_ms:.4f}"
             })
