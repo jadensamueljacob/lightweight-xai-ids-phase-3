@@ -1,0 +1,139 @@
+"""
+SENSOR (real capture mode): sniffs live packets, groups them into bidirectional flows the way
+CICFlowMeter does, computes the 15 features your model uses, and streams them to the detector.
+
+Needs: Npcap installed (tick "WinPcap API-compatible mode"), `pip install scapy`, and an
+ADMINISTRATOR terminal on Windows.
+
+  python flow_sensor_live.py --list-ifaces
+  python flow_sensor_live.py --iface "VirtualBox Host-Only Ethernet Adapter" --host 127.0.0.1
+
+Units follow CICFlowMeter: times in MICROseconds, packet length = payload bytes,
+std/variance = sample (n-1). Flows with zero duration are skipped (the training data dropped them:
+their Packets/s was infinite).
+"""
+import argparse, json, math, socket, threading, time
+import numpy as np
+from scapy.all import sniff, IP, TCP, UDP, get_if_list, conf
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--iface"); ap.add_argument("--list-ifaces", action="store_true")
+ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=9009)
+ap.add_argument("--dump", help="also append every emitted flow's raw features to this CSV (for diagnostics / retraining)")
+ap.add_argument("--idle", type=float, default=3.0, help="seconds of silence before a flow is closed")
+ap.add_argument("--max-age", type=float, default=120.0, help="flow timeout (CICFlowMeter uses 120s)")
+a = ap.parse_args()
+
+if a.list_ifaces:
+    from scapy.arch.windows import get_windows_if_list
+    for i in get_windows_if_list(): print(i["name"], "|", i.get("description"), "|", i.get("ips"))
+    raise SystemExit
+
+sock = socket.create_connection((a.host, a.port)); slock = threading.Lock()
+flows, closed, flock = {}, {}, threading.Lock()   # closed = recently finished flows (ignore their tail packets)
+
+
+class Flow:
+    __slots__ = ("fwd_src", "dport", "t", "ts_all", "ts_fwd", "len_all", "len_fwd", "len_bwd",
+                 "win_f", "win_b", "last", "closed")
+    def __init__(self, src, dport, now):
+        self.fwd_src, self.dport = src, dport
+        self.ts_all, self.ts_fwd = [], []
+        self.len_all, self.len_fwd, self.len_bwd = [], [], []
+        self.win_f = self.win_b = -1
+        self.last = self.t = now; self.closed = False
+
+    def add(self, pkt, src, now, payload, win):
+        fwd = (src == self.fwd_src)
+        self.ts_all.append(now); self.len_all.append(payload); self.last = now
+        if fwd: self.ts_fwd.append(now); self.len_fwd.append(payload)
+        else:   self.len_bwd.append(payload)
+        if win is not None:                       # TCP window of the FIRST TCP packet in each direction
+            if fwd and self.win_f == -1: self.win_f = win
+            if not fwd and self.win_b == -1: self.win_b = win
+
+def sstd(v):  return float(np.std(v, ddof=1)) if len(v) > 1 else 0.0
+def svar(v):  return float(np.var(v, ddof=1)) if len(v) > 1 else 0.0
+def mean(v):  return float(np.mean(v)) if len(v) else 0.0
+
+def features(f):
+    dur = (f.ts_all[-1] - f.ts_all[0]) * 1e6
+    if dur <= 0: return None
+    iat_all = np.diff(f.ts_all) * 1e6
+    iat_fwd = np.diff(f.ts_fwd) * 1e6 if len(f.ts_fwd) > 1 else np.array([])
+    return {
+        "Packet Length Mean": mean(f.len_all), "Packet Length Std": sstd(f.len_all),
+        "Packet Length Variance": svar(f.len_all), "Max Packet Length": float(max(f.len_all)),
+        "Init_Win_bytes_forward": float(f.win_f), "Init_Win_bytes_backward": float(f.win_b),
+        "Fwd IAT Total": float(iat_fwd.sum()), "Fwd IAT Mean": mean(iat_fwd),
+        "Flow IAT Mean": mean(iat_all), "Flow IAT Std": sstd(iat_all),
+        "Flow IAT Max": float(iat_all.max()) if len(iat_all) else 0.0,
+        "Fwd Packet Length Std": sstd(f.len_fwd),
+        "Bwd Packet Length Mean": mean(f.len_bwd), "Avg Bwd Segment Size": mean(f.len_bwd),
+        "Fwd Packets/s": len(f.len_fwd) / (dur / 1e6),
+    }
+
+dump_f = None
+def emit(key, f):
+    feats = features(f)
+    if feats is None: return
+    if dump_f:
+        with slock:
+            dump_f.write(",".join([f"{time.time():.3f}", f.fwd_src, key[1] if key[0] == f.fwd_src else key[0], str(f.dport),
+                                   str(len(f.len_fwd)), str(len(f.len_bwd))] + [repr(feats[k]) for k in FEAT_ORDER]) + "\n")
+            dump_f.flush()
+    rec = {"ts": time.time(), "src": f.fwd_src, "dst": key[1] if key[0] == f.fwd_src else key[0],
+           "dport": f.dport, "features": feats, "true": None, "source": "live"}
+    with slock:
+        try: sock.sendall((json.dumps(rec) + "\n").encode())
+        except OSError: pass
+
+def handle(pkt):
+    if IP not in pkt: return
+    ip = pkt[IP]; now = float(pkt.time)
+    if TCP in pkt:   l4, proto = pkt[TCP], 6
+    elif UDP in pkt: l4, proto = pkt[UDP], 17
+    else: return
+    if a.port in (l4.sport, l4.dport): return            # ignore our own sensor->detector traffic
+    ends = sorted([(ip.src, l4.sport), (ip.dst, l4.dport)])
+    key = (ends[0][0], ends[1][0], ends[0][1], ends[1][1], proto)
+    payload = len(bytes(l4.payload)); win = l4.window if proto == 6 else None
+    with flock:
+        t_closed = closed.get(key)
+        if t_closed is not None:
+            if now - t_closed < 2.0: return                # tail of a connection we already emitted (FIN/ACK leftovers)
+            closed.pop(key, None)
+        f = flows.get(key)
+        if f is None:
+            if proto == 6 and (int(l4.flags) & 0x12) != 0x02:
+                return                                      # a TCP flow may only START with a pure SYN (drops connection tails)
+            f = flows[key] = Flow(ip.src, l4.dport, now)
+        f.add(pkt, ip.src, now, payload, win)
+        if proto == 6 and (l4.flags & 0x05):              # FIN or RST ends the flow (as in CICFlowMeter)
+            flows.pop(key, None); closed[key] = now; emit_key = key
+        else: emit_key = None
+    if emit_key: emit(emit_key, f)
+
+def reaper():
+    while True:
+        time.sleep(1); now = time.time(); done = []
+        with flock:
+            for k, f in list(flows.items()):
+                if now - f.last > a.idle or now - f.t > a.max_age: done.append((k, flows.pop(k)))
+            for k, t in list(closed.items()):
+                if now - t > 5: closed.pop(k, None)
+        for k, f in done: emit(k, f)
+
+if a.dump:
+    import os
+    FEAT_ORDER = ["Packet Length Mean", "Packet Length Std", "Packet Length Variance", "Max Packet Length",
+                  "Init_Win_bytes_forward", "Init_Win_bytes_backward", "Fwd IAT Total", "Fwd IAT Mean",
+                  "Flow IAT Mean", "Flow IAT Std", "Flow IAT Max", "Fwd Packet Length Std",
+                  "Bwd Packet Length Mean", "Avg Bwd Segment Size", "Fwd Packets/s"]
+    new = not os.path.exists(a.dump)
+    dump_f = open(a.dump, "a")
+    if new: dump_f.write(",".join(["ts", "src", "dst", "dport", "n_fwd", "n_bwd"] + FEAT_ORDER) + "\n"); dump_f.flush()
+threading.Thread(target=reaper, daemon=True).start()
+print("sensor v4: tail-packet filter ON" + (f", dumping features to {a.dump}" if a.dump else ""))
+print(f"sniffing on {a.iface or 'default iface'} -> detector {a.host}:{a.port}  (Ctrl+C to stop)")
+sniff(iface=a.iface, prn=handle, store=False)

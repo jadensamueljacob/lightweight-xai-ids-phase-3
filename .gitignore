@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+old_runs/
+scratch/
+*.bak
+*.off

@@ -1,0 +1,53 @@
+{
+ "features": [
+  "Packet Length Mean",
+  "Init_Win_bytes_backward",
+  "Fwd IAT Total",
+  "Init_Win_bytes_forward",
+  "Max Packet Length",
+  "Flow IAT Mean",
+  "Fwd Packet Length Std",
+  "Flow IAT Std",
+  "Avg Bwd Segment Size",
+  "Packet Length Variance",
+  "Fwd Packets/s",
+  "Flow IAT Max",
+  "Fwd IAT Mean",
+  "Packet Length Std",
+  "Bwd Packet Length Mean"
+ ],
+ "data_min": [
+  0.0,
+  -1.0,
+  0.0,
+  -1.0,
+  0.0,
+  -12.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  -12.0,
+  0.0,
+  0.0,
+  0.0
+ ],
+ "data_max": [
+  2372.0,
+  65535.0,
+  120000000.0,
+  65535.0,
+  24820.0,
+  120000000.0,
+  7049.469004,
+  84800000.0,
+  5800.5,
+  22400000.0,
+  3000000.0,
+  120000000.0,
+  120000000.0,
+  4731.522394,
+  5800.5
+ ]
+}
