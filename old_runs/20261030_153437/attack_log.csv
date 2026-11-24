@@ -1,5 +1,0 @@
-epoch,phase,state
-1793300693.248,benign_1,start
-1793300733.366,benign_1,end
-1793300762.534,dos_slowhttp_1,start
-1793300788.604,dos_slowhttp_1,end
